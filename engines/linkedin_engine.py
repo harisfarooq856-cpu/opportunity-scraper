@@ -22,57 +22,57 @@ async def harvest_linkedin_index(industry="HVAC", location="Richmond, VA", targe
     results = []
     seen_urls = set()
     
-    # Build search queries
     search_queries = []
     if intent_query:
-        # Looking for buying intent posts
         search_queries.append(f'site:linkedin.com/posts/ "{intent_query}" "{location}"')
         search_queries.append(f'site:linkedin.com/pulse/ "{intent_query}"')
     else:
-        # Looking for decision-maker profiles
         for role in target_roles:
             search_queries.append(f'site:linkedin.com/in/ "{role}" "{industry}" "{location}"')
         search_queries.append(f'site:linkedin.com/company/ "{industry}" "{location}"')
         
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+        )
         context = await browser.new_context(user_agent=USER_AGENT, locale="en-US")
         page = await context.new_page()
+        
+        # Block heavy media resources
+        await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
         
         for q in search_queries:
             if len(results) >= limit:
                 break
-            search_url = f"https://www.google.com/search?q={urllib.parse.quote_plus(q)}&hl=en"
+            search_url = f"https://search.brave.com/search?q={urllib.parse.quote_plus(q)}"
             print(f"Querying Index: {q}")
             
             try:
-                await page.goto(search_url, timeout=25000)
-                await page.wait_for_timeout(2500)
+                await page.goto(search_url, wait_until="domcontentloaded", timeout=15000)
+                await page.wait_for_timeout(2000)
                 
-                # Extract search cards
-                links = await page.query_selector_all('div.g, div.tF2Cxc')
-                for card in links:
+                cards = await page.query_selector_all('div.snippet, div[data-type="web"]')
+                for c in cards:
                     if len(results) >= limit:
                         break
-                        
-                    a_tag = await card.query_selector('a')
-                    href = (await a_tag.get_attribute('href')) if a_tag else ''
-                    title_el = await card.query_selector('h3')
-                    title = (await title_el.inner_text()) if title_el else ''
-                    snippet_el = await card.query_selector('div.VwiC3b')
-                    snippet = (await snippet_el.inner_text()) if snippet_el else ''
+                    t_el = await c.query_selector('a .title, .title')
+                    l_el = await c.query_selector('a')
+                    d_el = await c.query_selector('.snippet-description, .snippet-content, div.body')
                     
-                    if 'linkedin.com' in href and href not in seen_urls and title:
+                    t = (await t_el.inner_text()).strip() if t_el else ""
+                    href = (await l_el.get_attribute('href')) if l_el else ""
+                    snippet = (await d_el.inner_text()).strip() if d_el else ""
+                    
+                    if 'linkedin.com' in href and href not in seen_urls and t:
                         seen_urls.add(href)
                         
-                        # Clean name & headline
-                        # Format on Google: "John Doe - Owner - ABC Heating | LinkedIn"
-                        clean_title = title.replace(' | LinkedIn', '').replace(' - LinkedIn', '').strip()
+                        clean_title = t.replace(' | LinkedIn', '').replace(' - LinkedIn', '').strip()
                         parts = clean_title.split(' - ')
                         
                         person_name = parts[0].strip() if len(parts) > 0 else clean_title
                         headline = parts[1].strip() if len(parts) > 1 else snippet[:120]
-                        company = parts[2].strip() if len(parts) > 2 else "Verified Business"
+                        company = parts[2].strip() if len(parts) > 2 else industry
                         
                         item = {
                             "method": "Method 1 (Search Index)",
@@ -86,13 +86,148 @@ async def harvest_linkedin_index(industry="HVAC", location="Richmond, VA", targe
                             "snippet": snippet.strip()
                         }
                         results.append(item)
-                        print(f"  [{len(results)}/{limit}] {person_name} | {headline[:60]} -> {href}")
+                        print(f"  [{len(results)}/{limit}] {person_name} | {headline[:60]}")
+                        print(f"      🔗 {href}")
             except Exception as e:
-                print(f"  [!] Index search error: {e}")
+                print(f"  [!] Index search note: {e}")
                 
         await browser.close()
         
     print(f"✅ Method 1 Complete: Extracted {len(results)} authentic LinkedIn records.\n")
+    return results
+
+# =====================================================================
+# METHOD 2: SPECIFIC COMPANY & DECISION MAKER HARVESTER
+# =====================================================================
+async def harvest_company_decision_makers(company_name, roles=None, li_at_cookie=None, limit=10):
+    """
+    Extracts key decision makers (Owners, Founders, CXOs, Directors) for a SPECIFIC company.
+    Uses authenticated session if cookie provided, otherwise uses targeted open company index.
+    """
+    if roles is None:
+        roles = ["Owner", "Founder", "President", "CEO", "Partner", "General Manager", "Director of Operations", "VP"]
+        
+    print("\n" + "=" * 70)
+    print(f" 🎯 [Company Deep-Dive] DECISION MAKERS FOR: '{company_name}'")
+    print("=" * 70)
+    
+    active_cookie = li_at_cookie or LINKEDIN_LI_AT
+    results = []
+    seen_urls = set()
+    
+    # 1. If cookie available -> Direct Internal Search
+    if active_cookie:
+        print(f"Connecting with authenticated LinkedIn session (li_at)...")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            context = await browser.new_context(
+                user_agent=USER_AGENT,
+                locale="en-US",
+                proxy=PLAYWRIGHT_PROXY
+            )
+            await context.add_cookies([{
+                "name": "li_at",
+                "value": active_cookie,
+                "domain": ".linkedin.com",
+                "path": "/"
+            }])
+            page = await context.new_page()
+            
+            for r in roles[:4]:
+                if len(results) >= limit:
+                    break
+                search_url = f"https://www.linkedin.com/search/results/people/?keywords={urllib.parse.quote_plus(f'{company_name} {r}')}"
+                print(f"Searching LinkedIn Internal: '{company_name}' + {r} ...")
+                try:
+                    await page.goto(search_url, timeout=30000)
+                    await page.wait_for_timeout(3500)
+                    
+                    cards = await page.query_selector_all('li.reusable-search__result-container, div.update-components-text')
+                    for c in cards:
+                        if len(results) >= limit:
+                            break
+                        text = await c.inner_text()
+                        lines = [l.strip() for l in text.split('\n') if l.strip()]
+                        link_el = await c.query_selector('a.app-aware-link, a')
+                        link = (await link_el.get_attribute('href')) if link_el else ""
+                        if link and '?' in link:
+                            link = link.split('?')[0]
+                            
+                        name = lines[0] if lines else "LinkedIn Member"
+                        headline = lines[1] if len(lines) > 1 else r
+                        loc = lines[2] if len(lines) > 2 else ""
+                        
+                        if link and link not in seen_urls and "linkedin.com/in/" in link:
+                            seen_urls.add(link)
+                            results.append({
+                                "company": company_name,
+                                "name": name,
+                                "role_headline": headline,
+                                "target_role_match": r,
+                                "location": loc,
+                                "url": link
+                            })
+                            print(f"  ✓ Found Decision Maker: {name} ({headline}) -> {link}")
+                except Exception as e:
+                    print(f"  [!] Session query note: {e}")
+            await browser.close()
+            
+    # 2. Fallback / Zero-Cookie Targeted Search
+    if not results:
+        print(f"Running zero-login targeted company decision-maker index...")
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox', '--disable-dev-shm-usage', '--disable-gpu']
+            )
+            context = await browser.new_context(user_agent=USER_AGENT, locale="en-US")
+            page = await context.new_page()
+            await page.route("**/*", lambda route: route.abort() if route.request.resource_type in ["image", "media", "font"] else route.continue_())
+            
+            for r in roles:
+                if len(results) >= limit:
+                    break
+                q = f'site:linkedin.com/in/ "{company_name}" "{r}"'
+                url = f"https://search.brave.com/search?q={urllib.parse.quote_plus(q)}"
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+                    await page.wait_for_timeout(1800)
+                    
+                    cards = await page.query_selector_all('div.snippet, div[data-type="web"]')
+                    for c in cards:
+                        if len(results) >= limit:
+                            break
+                        t_el = await c.query_selector('a .title, .title')
+                        l_el = await c.query_selector('a')
+                        d_el = await c.query_selector('.snippet-description, .snippet-content, div.body')
+                        
+                        t = (await t_el.inner_text()).strip() if t_el else ""
+                        href = (await l_el.get_attribute('href')) if l_el else ""
+                        snippet = (await d_el.inner_text()).strip() if d_el else ""
+                        
+                        if 'linkedin.com/in/' in href and href not in seen_urls and t:
+                            seen_urls.add(href)
+                            clean_t = t.replace(' | LinkedIn', '').replace(' - LinkedIn', '').strip()
+                            parts = clean_t.split(' - ')
+                            p_name = parts[0].strip() if len(parts) > 0 else clean_t
+                            p_headline = parts[1].strip() if len(parts) > 1 else snippet[:100]
+                            
+                            results.append({
+                                "company": company_name,
+                                "name": p_name,
+                                "role_headline": p_headline,
+                                "target_role_match": r,
+                                "location": "Verified Metro",
+                                "url": href,
+                                "snippet": snippet
+                            })
+                            print(f"  ✓ Found Decision Maker: {p_name} | {p_headline[:50]}")
+                            print(f"      🔗 {href}")
+                except Exception as e:
+                    pass
+            await browser.close()
+            
+    print(f"\n✅ Company Deep-Dive Complete: Extracted {len(results)} decision-makers for '{company_name}'.\n")
     return results
 
 # =====================================================================
@@ -116,7 +251,6 @@ async def harvest_linkedin_session(target_url="https://www.linkedin.com/search/r
     results = []
     
     async with async_playwright() as p:
-        # Launch browser with residential proxy
         browser = await p.chromium.launch(headless=True)
         context = await browser.new_context(
             user_agent=USER_AGENT,
@@ -124,7 +258,6 @@ async def harvest_linkedin_session(target_url="https://www.linkedin.com/search/r
             proxy=PLAYWRIGHT_PROXY
         )
         
-        # Inject li_at authentication cookie
         await context.add_cookies([
             {
                 "name": "li_at",
@@ -141,14 +274,12 @@ async def harvest_linkedin_session(target_url="https://www.linkedin.com/search/r
             await page.goto(target_url, timeout=35000)
             await page.wait_for_timeout(4000)
             
-            # Check if login succeeded
             current_url = page.url
             if "login" in current_url or "authwall" in current_url or "checkpoint" in current_url:
                 print("  [!] LinkedIn requested verification / cookie expired. Falling back to Method 1.")
                 await browser.close()
                 return await harvest_linkedin_index(limit=limit)
                 
-            # Extract live search result cards
             cards = await page.query_selector_all('li.reusable-search__result-container, div.update-components-text')
             print(f"Discovered {len(cards)} live items on LinkedIn page.")
             
@@ -157,7 +288,6 @@ async def harvest_linkedin_session(target_url="https://www.linkedin.com/search/r
                     text = await c.inner_text()
                     lines = [l.strip() for l in text.split('\n') if l.strip()]
                     
-                    # Extract profile link
                     link_el = await c.query_selector('a.app-aware-link, a')
                     link = (await link_el.get_attribute('href')) if link_el else ""
                     if link and '?' in link:
@@ -177,7 +307,7 @@ async def harvest_linkedin_session(target_url="https://www.linkedin.com/search/r
                         "raw_snippet": " ".join(lines[:4])
                     })
                     print(f"  [{len(results)}/{limit}] {name} ({headline[:50]})")
-                except Exception as e:
+                except Exception:
                     pass
                     
         except Exception as err:
